@@ -1,7 +1,7 @@
 {
   "name": "spinupwp-mcp",
-  "version": "1.0.0",
-  "description": "A Model Context Protocol (MCP) server integration for the SpinupWP v1 JSON API.",
+  "version": "2.0.0",
+  "description": "A read-only Model Context Protocol (MCP) server integration for the SpinupWP v1 JSON API.",
   "author": {
     "name": "Faruk Garic",
     "url": "https://farukgaric.com"
@@ -17,7 +17,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-username/spinupwp-mcp.git"
+    "url": "https://github.com/ozzyrod/spinupwp-mcp.git"
   },
   "type": "module",
   "scripts": {
@@ -25,9 +25,8 @@
     "start": "node build/index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.1",
-    "axios": "^1.6.0",
-    "dotenv": "^17.3.1"
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "axios": "^1.20.0"
   },
   "devDependencies": {
     "@types/node": "^20.19.33",
