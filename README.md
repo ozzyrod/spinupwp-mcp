@@ -1,95 +1,72 @@
-# SpinupWP MCP Server
+# SpinupWP MCP Server (read-only)
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server integration for the SpinupWP v1 JSON API. This allows AI assistants (like Claude, Cursor, and custom agents) to seamlessly observe and control your SpinupWP infrastructure.
+A read-only [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for the SpinupWP v1 JSON API. It lets AI assistants (like Claude, Cursor, and custom agents) inspect your SpinupWP servers and sites without being able to change them.
 
-## Features
+This is a fork of [farukgaric/spinupwp-mcp](https://github.com/farukgaric/spinupwp-mcp), hardened for safe use:
 
-This server currently exposes the following tools:
+- **No write tools.** SpinupWP API tokens can't be limited to read-only, so every tool that could change or delete something was removed, and the HTTP client refuses any request other than `GET`.
+- **IDs are validated.** Every ID must be a positive integer before it goes into a URL, so a crafted value like `../servers/5` can't reach a different endpoint.
+- **Complete results.** The server, site and SSH key lists fetch every page instead of only the first 10 results. Events are the exception: they build up over an account's lifetime, so `list_events` returns one trimmed page at a time.
+- **Secrets stay out of output.** `get_site` redacts the git push-to-deploy URL, and errors report only the HTTP status, never request headers.
+- **Up-to-date dependencies**, with no `dotenv`: the token comes only from the MCP client's environment.
+
+## Tools
 
 - `list_servers`: List all SpinupWP servers and their hardware/update status.
-- `get_server`: Retrieve detailed information for a specific server.
-- `reboot_server`: Reboot a specific SpinupWP server.
-- `restart_service`: Restart a specific service (`nginx`, `php`, `mysql`, `redis`) on a server.
-- `list_sites`: List all WordPress sites hosted on a specific server.
-- `get_site`: Retrieve detailed information for a specific WordPress site.
-- `purge_site_cache`: Purge the page cache for a specific WordPress site.
-- `run_site_git_deployment`: Trigger a Git deployment for a specific site.
-- `correct_site_file_permissions`: Correct the file permissions for a site.
-- `list_events`: List recent SpinupWP events (async background tasks).
-- `get_event`: Get the specific details and status of a single event ID.
-- `list_ssh_keys`: List the SSH keys configured in the SpinupWP account.
-- `add_ssh_key`: Add a new SSH public key for server access.
-- `create_site`: Provision a brand new WordPress site on a server.
-- `delete_site`: Delete an existing site.
-- `create_server`: Provision a brand new custom server.
-- `delete_server`: Delete a server entirely.
+- `get_server`: Get details for a specific server.
+- `list_sites`: List all sites on a specific server.
+- `get_site`: Get details for a specific site.
+- `list_events`: List one page (up to 100) of event summaries, optionally filtered by server or site. Pass `page` for more; use `get_event` for an event's full output.
+- `get_event`: Get the details and status of a single event.
+- `list_ssh_keys`: List the SSH public keys configured in the account.
 
 ## Prerequisites
 
-1. Node.js (v18 or newer recommended).
-2. A SpinupWP API Token. You can generate this from the "API Tokens" tab in your SpinupWP account settings.
+1. Node.js 20 or newer.
+2. A SpinupWP API token, from the "API Tokens" tab in your SpinupWP account settings. Create a dedicated token for this server and revoke it when you no longer need it.
 
 ## Installation
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/farukgaric/spinupwp-mcp.git
-   cd spinupwp-mcp
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-3. Build the TypeScript files:
-   ```bash
-   npm run build
-   ```
-
-4. Configure your environment:
-   Copy `.env.example` to `.env` and insert your SpinupWP API token.
-   ```bash
-   cp .env.example .env
-   ```
-   Edit `.env`:
-   ```env
-   SPINUPWP_API_TOKEN=your_actual_token_here
-   ```
+```bash
+git clone https://github.com/ozzyrod/spinupwp-mcp.git
+cd spinupwp-mcp
+npm ci --ignore-scripts
+npm run build
+```
 
 ## Usage
 
-This server is designed to be consumed by an MCP client over standard I/O (stdio). 
+The server talks to its MCP client over standard I/O (stdio). Pass the token through the client's `env` setting rather than a `.env` file.
 
-### Example: Claude Desktop Configuration
+### Claude Code
 
-Update your `claude_desktop_config.json` (on macOS, usually located at `~/Library/Application Support/Claude/claude_desktop_config.json`):
+```bash
+claude mcp add spinupwp -e SPINUPWP_API_TOKEN=your_token -- node /absolute/path/to/spinupwp-mcp/build/index.js
+```
+
+### Claude Desktop
+
+In `claude_desktop_config.json` (on macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
-    "spinupwp-local": {
+    "spinupwp": {
       "command": "node",
-      "args": [
-        "/absolute/path/to/spinupwp-mcp/build/index.js"
-      ]
+      "args": ["/absolute/path/to/spinupwp-mcp/build/index.js"],
+      "env": { "SPINUPWP_API_TOKEN": "your_token" }
     }
   }
 }
 ```
-*(Ensure you use the absolute path to your cloned repository.)*
 
 ## Development
 
-- Start the server manually (ensure your `.env` is loaded):
-  ```bash
-  npm start
-  ```
-- To make changes to the tools, edit `src/index.ts` and rebuild using `npm run build`. 
+Edit `src/index.ts`, then rebuild with `npm run build`. Keep it read-only: don't add tools that send anything other than `GET` requests.
 
 ## Author
 
-**Faruk Garic** ([https://farukgaric.com](https://farukgaric.com))
+Originally created by **Faruk Garic** ([https://farukgaric.com](https://farukgaric.com)). Read-only fork maintained by Ozzy Rodriguez.
 
 ## License
 

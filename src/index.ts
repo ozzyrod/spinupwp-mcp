@@ -6,13 +6,10 @@ import {
     ListToolsRequestSchema,
     McpError,
 } from "@modelcontextprotocol/sdk/types.js";
-import axios from "axios";
-import dotenv from "dotenv";
+import axios, { AxiosError } from "axios";
 
-const oldLog = console.log;
-console.log = () => { };
-dotenv.config();
-console.log = oldLog;
+// This server is deliberately read-only. SpinupWP API tokens cannot be scoped,
+// so the code itself is the only thing preventing writes.
 
 const API_TOKEN = process.env.SPINUPWP_API_TOKEN;
 
@@ -20,18 +17,83 @@ if (!API_TOKEN) {
     throw new Error("Fatal: SPINUPWP_API_TOKEN environment variable is required.");
 }
 
+const PAGE_LIMIT = 100;
+const MAX_PAGES = 50;
+
 const apiClient = axios.create({
     baseURL: "https://api.spinupwp.app/v1",
+    timeout: 30_000,
+    maxRedirects: 0,
     headers: {
         Authorization: `Bearer ${API_TOKEN}`,
         Accept: "application/json",
     },
 });
 
+apiClient.interceptors.request.use((config) => {
+    const method = (config.method ?? "get").toLowerCase();
+    if (method !== "get") {
+        throw new Error(`Blocked ${method.toUpperCase()} request: this server is read-only.`);
+    }
+    return config;
+});
+
+// The SDK does not enforce inputSchema, so every ID is checked here before it
+// can reach a URL path.
+function parseId(args: Record<string, unknown>, name: string, required: true): number;
+function parseId(args: Record<string, unknown>, name: string, required: false): number | undefined;
+function parseId(args: Record<string, unknown>, name: string, required: boolean): number | undefined {
+    const value = args[name];
+    if (value === undefined || value === null || value === "") {
+        if (required) {
+            throw new McpError(ErrorCode.InvalidParams, `${name} is required`);
+        }
+        return undefined;
+    }
+    const id = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
+    if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) {
+        throw new McpError(ErrorCode.InvalidParams, `${name} must be a positive integer`);
+    }
+    return id;
+}
+
+async function fetchAllPages(path: string, params: Record<string, number> = {}): Promise<any[]> {
+    let results: any[] = [];
+    for (let page = 1; page <= MAX_PAGES; page++) {
+        const response = await apiClient.get(path, { params: { ...params, page, limit: PAGE_LIMIT } });
+        results = results.concat(response.data.data);
+        if (!response.data.pagination?.next) {
+            return results;
+        }
+    }
+    throw new Error(`${path} returned more than ${MAX_PAGES * PAGE_LIMIT} results; stopping to avoid an unbounded loop.`);
+}
+
+function redactSite(site: any): any {
+    if (site?.git?.deployment_url) {
+        return { ...site, git: { ...site.git, deployment_url: "[redacted]" } };
+    }
+    return site;
+}
+
+function errorText(error: unknown): string {
+    if (error instanceof McpError) {
+        return `Invalid input: ${error.message}`;
+    }
+    if (error instanceof AxiosError) {
+        return `SpinupWP API Error: ${error.response ? `HTTP ${error.response.status}` : error.message}`;
+    }
+    return `SpinupWP API Error: ${error instanceof Error ? error.message : String(error)}`;
+}
+
+function json(data: unknown) {
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+}
+
 const server = new Server(
     {
         name: "spinupwp-mcp",
-        version: "1.0.0",
+        version: "2.0.0",
     },
     {
         capabilities: {
@@ -40,31 +102,16 @@ const server = new Server(
     }
 );
 
-// Define available tools
+const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: true };
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
         tools: [
             {
                 name: "list_servers",
                 description: "List all SpinupWP servers and their hardware/update status",
-                inputSchema: {
-                    type: "object",
-                    properties: {},
-                },
-            },
-            {
-                name: "list_sites",
-                description: "List all WordPress sites on a specific SpinupWP server",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        server_id: {
-                            type: "number",
-                            description: "The ID of the SpinupWP server",
-                        },
-                    },
-                    required: ["server_id"],
-                },
+                inputSchema: { type: "object", properties: {} },
+                annotations: readOnly,
             },
             {
                 name: "get_server",
@@ -72,88 +119,48 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 inputSchema: {
                     type: "object",
                     properties: {
-                        server_id: { type: "number", description: "The ID of the SpinupWP server" },
+                        server_id: { type: "integer", minimum: 1, description: "The ID of the SpinupWP server" },
                     },
                     required: ["server_id"],
                 },
+                annotations: readOnly,
             },
             {
-                name: "reboot_server",
-                description: "Reboot a specific SpinupWP server",
+                name: "list_sites",
+                description: "List all sites on a specific SpinupWP server",
                 inputSchema: {
                     type: "object",
                     properties: {
-                        server_id: { type: "number", description: "The ID of the SpinupWP server" },
+                        server_id: { type: "integer", minimum: 1, description: "The ID of the SpinupWP server" },
                     },
                     required: ["server_id"],
                 },
-            },
-            {
-                name: "restart_service",
-                description: "Restart a specific service (nginx, php, mysql, redis) on a SpinupWP server",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        server_id: { type: "number", description: "The ID of the SpinupWP server" },
-                        service: { type: "string", description: "The service to restart", enum: ["nginx", "php", "mysql", "redis"] },
-                    },
-                    required: ["server_id", "service"],
-                },
+                annotations: readOnly,
             },
             {
                 name: "get_site",
-                description: "Get details for a specific WordPress site",
+                description: "Get details for a specific site (the git push-to-deploy URL is redacted)",
                 inputSchema: {
                     type: "object",
                     properties: {
-                        site_id: { type: "number", description: "The ID of the site" },
+                        site_id: { type: "integer", minimum: 1, description: "The ID of the site" },
                     },
                     required: ["site_id"],
                 },
-            },
-            {
-                name: "purge_site_cache",
-                description: "Purge the page cache for a specific WordPress site",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        site_id: { type: "number", description: "The ID of the site" },
-                    },
-                    required: ["site_id"],
-                },
-            },
-            {
-                name: "run_site_git_deployment",
-                description: "Run a git deployment for a specific WordPress site",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        site_id: { type: "number", description: "The ID of the site" },
-                    },
-                    required: ["site_id"],
-                },
-            },
-            {
-                name: "correct_site_file_permissions",
-                description: "Correct the file permissions for a specific WordPress site",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        site_id: { type: "number", description: "The ID of the site" },
-                    },
-                    required: ["site_id"],
-                },
+                annotations: readOnly,
             },
             {
                 name: "list_events",
-                description: "List recent SpinupWP events (optionally filtered by server_id or site_id)",
+                description: "List one page (up to 100) of SpinupWP events as summaries, without command output. Use `page` to see more and get_event for an event's full output. The response says whether another page exists.",
                 inputSchema: {
                     type: "object",
                     properties: {
-                        server_id: { type: "number", description: "Filter events by server ID" },
-                        site_id: { type: "number", description: "Filter events by site ID" },
+                        page: { type: "integer", minimum: 1, description: "Page number to fetch (default 1)" },
+                        server_id: { type: "integer", minimum: 1, description: "Filter events by server ID" },
+                        site_id: { type: "integer", minimum: 1, description: "Filter events by site ID" },
                     },
                 },
+                annotations: readOnly,
             },
             {
                 name: "get_event",
@@ -161,425 +168,121 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 inputSchema: {
                     type: "object",
                     properties: {
-                        event_id: { type: "number", description: "The ID of the event" },
+                        event_id: { type: "integer", minimum: 1, description: "The ID of the event" },
                     },
                     required: ["event_id"],
                 },
+                annotations: readOnly,
             },
             {
                 name: "list_ssh_keys",
-                description: "List SSH keys configured in SpinupWP",
-                inputSchema: {
-                    type: "object",
-                    properties: {},
-                },
-            },
-            {
-                name: "add_ssh_key",
-                description: "Add a new SSH public key to SpinupWP",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        name: { type: "string", description: "A friendly name for the key" },
-                        public_key: { type: "string", description: "The SSH public key string" },
-                    },
-                    required: ["name", "public_key"],
-                },
-            },
-            {
-                name: "create_site",
-                description: "Create a new WordPress site on a server",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        server_id: { type: "number", description: "The ID of the server" },
-                        domain: { type: "string", description: "The primary domain for the site" },
-                    },
-                    required: ["server_id", "domain"],
-                },
-            },
-            {
-                name: "delete_site",
-                description: "Delete a specific WordPress site",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        site_id: { type: "number", description: "The ID of the site" },
-                    },
-                    required: ["site_id"],
-                },
-            },
-            {
-                name: "delete_server",
-                description: "Delete a specific SpinupWP server",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        server_id: { type: "number", description: "The ID of the server" },
-                        delete_server_on_provider: { type: "boolean", description: "Whether to also delete the server on the cloud provider" },
-                    },
-                    required: ["server_id"],
-                },
-            },
-            {
-                name: "create_server",
-                description: "Provision a new custom SpinupWP server (MVP using existing infrastructure)",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        provider_name: { type: "string", description: "Name of the server provider" },
-                        ubuntu_version: { type: "string", description: "Ubuntu LTS version (e.g. '24.04', '22.04')" },
-                        ip_address: { type: "string", description: "The server's public IP address" },
-                        username: { type: "string", description: "The SSH username (usually root)" },
-                        hostname: { type: "string", description: "The hostname for the server" },
-                    },
-                    required: ["provider_name", "ubuntu_version", "ip_address", "username", "hostname"],
-                },
+                description: "List SSH public keys configured in SpinupWP",
+                inputSchema: { type: "object", properties: {} },
+                annotations: readOnly,
             },
         ],
     };
 });
 
-// Execute tool requests
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    switch (request.params.name) {
-        case "list_servers":
-            try {
-                const response = await apiClient.get("/servers");
-                // Strip out unnecessary bloat to save LLM context window limits
-                const servers = response.data.data.map((s: any) => ({
+    const args = (request.params.arguments ?? {}) as Record<string, unknown>;
+
+    try {
+        switch (request.params.name) {
+            case "list_servers": {
+                const servers = await fetchAllPages("/servers");
+                return json(servers.map((s: any) => ({
                     id: s.id,
                     name: s.name,
                     ip_address: s.ip_address,
                     ubuntu_version: s.ubuntu_version,
                     disk_space: s.disk_space,
-                    database_server: s.database.server
-                }));
-
-                return {
-                    content: [{ type: "text", text: JSON.stringify(servers, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
+                    database_server: s.database?.server,
+                })));
             }
 
-        case "list_sites":
-            try {
-                const { server_id } = request.params.arguments as any;
-                if (!server_id) {
-                    throw new McpError(ErrorCode.InvalidParams, "server_id is required");
-                }
+            case "get_server": {
+                const serverId = parseId(args, "server_id", true);
+                const response = await apiClient.get(`/servers/${serverId}`);
+                return json(response.data.data);
+            }
 
-                // Fetch all sites for the server, handling pagination
-                let allSites: any[] = [];
-                let page = 1;
-                while (true) {
-                    const response = await apiClient.get(`/sites`, { params: { server_id, page } });
-                    allSites = allSites.concat(response.data.data);
-                    if (!response.data.pagination.next) {
-                        break;
-                    }
-                    page++;
-                }
-
-                const sites = allSites.map((site: any) => ({
+            case "list_sites": {
+                const serverId = parseId(args, "server_id", true);
+                const sites = await fetchAllPages("/sites", { server_id: serverId });
+                return json(sites.map((site: any) => ({
                     id: site.id,
                     domain: site.domain,
                     php_version: site.php_version,
-                    page_cache: site.page_cache.enabled,
-                    https: site.https.enabled
-                }));
-
-                return {
-                    content: [{ type: "text", text: JSON.stringify(sites, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
+                    page_cache: site.page_cache?.enabled,
+                    https: site.https?.enabled,
+                })));
             }
 
-        case "get_server":
-            try {
-                const { server_id } = request.params.arguments as any;
-                if (!server_id) {
-                    throw new McpError(ErrorCode.InvalidParams, "server_id is required");
-                }
-                const response = await apiClient.get(`/servers/${server_id}`);
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
+            case "get_site": {
+                const siteId = parseId(args, "site_id", true);
+                const response = await apiClient.get(`/sites/${siteId}`);
+                return json(redactSite(response.data.data));
             }
 
-        case "reboot_server":
-            try {
-                const { server_id } = request.params.arguments as any;
-                if (!server_id) {
-                    throw new McpError(ErrorCode.InvalidParams, "server_id is required");
-                }
-                const response = await apiClient.post(`/servers/${server_id}/reboot`);
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data || { success: true }, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
-            }
-
-        case "restart_service":
-            try {
-                const { server_id, service } = request.params.arguments as any;
-                if (!server_id || !service) {
-                    throw new McpError(ErrorCode.InvalidParams, "server_id and service are required");
-                }
-                if (!["nginx", "php", "mysql", "redis"].includes(service)) {
-                    throw new McpError(ErrorCode.InvalidParams, "Invalid service. Must be nginx, php, mysql, or redis.");
-                }
-                const response = await apiClient.post(`/servers/${server_id}/services/${service}/restart`);
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data || { success: true }, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
-            }
-
-        case "get_site":
-            try {
-                const { site_id } = request.params.arguments as any;
-                if (!site_id) {
-                    throw new McpError(ErrorCode.InvalidParams, "site_id is required");
-                }
-                const response = await apiClient.get(`/sites/${site_id}`);
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
-            }
-
-        case "purge_site_cache":
-            try {
-                const { site_id } = request.params.arguments as any;
-                if (!site_id) {
-                    throw new McpError(ErrorCode.InvalidParams, "site_id is required");
-                }
-                const response = await apiClient.post(`/sites/${site_id}/page-cache/purge`);
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data || { success: true }, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
-            }
-
-        case "run_site_git_deployment":
-            try {
-                const { site_id } = request.params.arguments as any;
-                if (!site_id) {
-                    throw new McpError(ErrorCode.InvalidParams, "site_id is required");
-                }
-                const response = await apiClient.post(`/sites/${site_id}/git/deploy`);
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
-            }
-
-        case "correct_site_file_permissions":
-            try {
-                const { site_id } = request.params.arguments as any;
-                if (!site_id) {
-                    throw new McpError(ErrorCode.InvalidParams, "site_id is required");
-                }
-                const response = await apiClient.post(`/sites/${site_id}/file-permissions/correct`);
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
-            }
-
-        case "list_events":
-            try {
-                const { server_id, site_id } = request.params.arguments as any || {};
-                const params: any = {};
-                if (server_id) params.server_id = server_id;
-                if (site_id) params.site_id = site_id;
-
-                const response = await apiClient.get('/events', { params });
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
-            }
-
-        case "get_event":
-            try {
-                const { event_id } = request.params.arguments as any;
-                if (!event_id) {
-                    throw new McpError(ErrorCode.InvalidParams, "event_id is required");
-                }
-                const response = await apiClient.get(`/events/${event_id}`);
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
-            }
-
-        case "list_ssh_keys":
-            try {
-                const response = await apiClient.get('/ssh-keys');
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
-            }
-
-        case "add_ssh_key":
-            try {
-                const { name, public_key } = request.params.arguments as any;
-                if (!name || !public_key) {
-                    throw new McpError(ErrorCode.InvalidParams, "name and public_key are required");
-                }
-                const response = await apiClient.post('/ssh-keys', { name, public_key });
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
-            }
-
-        case "create_site":
-            try {
-                const { server_id, domain } = request.params.arguments as any;
-                if (!server_id || !domain) {
-                    throw new McpError(ErrorCode.InvalidParams, "server_id and domain are required");
-                }
-                const response = await apiClient.post('/sites', { server_id, domain });
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
-            }
-
-        case "delete_site":
-            try {
-                const { site_id } = request.params.arguments as any;
-                if (!site_id) {
-                    throw new McpError(ErrorCode.InvalidParams, "site_id is required");
-                }
-                const response = await apiClient.delete(`/sites/${site_id}`);
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data || { success: true }, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
-            }
-
-        case "delete_server":
-            try {
-                const { server_id, delete_server_on_provider } = request.params.arguments as any;
-                if (!server_id) {
-                    throw new McpError(ErrorCode.InvalidParams, "server_id is required");
-                }
-                const response = await apiClient.delete(`/servers/${server_id}`, {
-                    data: { delete_server_on_provider: !!delete_server_on_provider }
+            case "list_events": {
+                // Events accumulate for the account's lifetime and carry full command
+                // output, so this returns one trimmed page instead of every page.
+                const page = parseId(args, "page", false) ?? 1;
+                const params: Record<string, number> = { page, limit: PAGE_LIMIT };
+                const serverId = parseId(args, "server_id", false);
+                const siteId = parseId(args, "site_id", false);
+                if (serverId !== undefined) params.server_id = serverId;
+                if (siteId !== undefined) params.site_id = siteId;
+                const response = await apiClient.get("/events", { params });
+                return json({
+                    page,
+                    has_more: Boolean(response.data.pagination?.next),
+                    total: response.data.pagination?.count,
+                    events: response.data.data.map((e: any) => ({
+                        id: e.id,
+                        server_id: e.server_id,
+                        name: e.name,
+                        status: e.status,
+                        initiated_by: e.initiated_by,
+                        created_at: e.created_at,
+                        finished_at: e.finished_at,
+                    })),
                 });
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data || { success: true }, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
             }
 
-        case "create_server":
-            try {
-                const { provider_name, ubuntu_version, ip_address, username, hostname } = request.params.arguments as any;
-                if (!provider_name || !ubuntu_version || !ip_address || !username || !hostname) {
-                    throw new McpError(ErrorCode.InvalidParams, "provider_name, ubuntu_version, ip_address, username, and hostname are required");
-                }
-                const response = await apiClient.post('/servers/custom', {
-                    provider_name, ubuntu_version, ip_address, username, hostname
-                });
-                return {
-                    content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
-                };
-            } catch (error: any) {
-                return {
-                    content: [{ type: "text", text: `SpinupWP API Error: ${error.message}` }],
-                    isError: true,
-                };
+            case "get_event": {
+                const eventId = parseId(args, "event_id", true);
+                const response = await apiClient.get(`/events/${eventId}`);
+                return json(response.data.data);
             }
 
-        default:
-            throw new McpError(
-                ErrorCode.MethodNotFound,
-                `Unknown tool: ${request.params.name}`
-            );
+            case "list_ssh_keys":
+                return json(await fetchAllPages("/ssh-keys"));
+
+            default:
+                throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
+        }
+    } catch (error) {
+        if (error instanceof McpError && error.code === ErrorCode.MethodNotFound) {
+            throw error;
+        }
+        return {
+            content: [{ type: "text", text: errorText(error) }],
+            isError: true,
+        };
     }
 });
 
-// Start the server using stdio transport
 async function run() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    // WARNING: Never use console.log() here. It will corrupt the JSON-RPC message stream.
-    console.error("SpinupWP MCP server is running and listening on stdio.");
+    // Never use console.log() here: stdout carries the JSON-RPC stream.
+    console.error("SpinupWP MCP server (read-only) is running on stdio.");
 }
 
 run().catch((error) => {
-    console.error("Fatal server error:", error);
+    console.error("Fatal server error:", error instanceof Error ? error.message : error);
     process.exit(1);
 });
