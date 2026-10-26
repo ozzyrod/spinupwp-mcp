@@ -151,10 +151,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             {
                 name: "list_events",
-                description: "List SpinupWP events (optionally filtered by server_id or site_id)",
+                description: "List one page (up to 100) of SpinupWP events as summaries, without command output. Use `page` to see more and get_event for an event's full output. The response says whether another page exists.",
                 inputSchema: {
                     type: "object",
                     properties: {
+                        page: { type: "integer", minimum: 1, description: "Page number to fetch (default 1)" },
                         server_id: { type: "integer", minimum: 1, description: "Filter events by server ID" },
                         site_id: { type: "integer", minimum: 1, description: "Filter events by site ID" },
                     },
@@ -225,12 +226,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
 
             case "list_events": {
-                const params: Record<string, number> = {};
+                // Events accumulate for the account's lifetime and carry full command
+                // output, so this returns one trimmed page instead of every page.
+                const page = parseId(args, "page", false) ?? 1;
+                const params: Record<string, number> = { page, limit: PAGE_LIMIT };
                 const serverId = parseId(args, "server_id", false);
                 const siteId = parseId(args, "site_id", false);
                 if (serverId !== undefined) params.server_id = serverId;
                 if (siteId !== undefined) params.site_id = siteId;
-                return json(await fetchAllPages("/events", params));
+                const response = await apiClient.get("/events", { params });
+                return json({
+                    page,
+                    has_more: Boolean(response.data.pagination?.next),
+                    total: response.data.pagination?.count,
+                    events: response.data.data.map((e: any) => ({
+                        id: e.id,
+                        server_id: e.server_id,
+                        name: e.name,
+                        status: e.status,
+                        initiated_by: e.initiated_by,
+                        created_at: e.created_at,
+                        finished_at: e.finished_at,
+                    })),
+                });
             }
 
             case "get_event": {
